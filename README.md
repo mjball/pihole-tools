@@ -1,1 +1,82 @@
 # pihole-tools
+
+Small utilities for running and maintaining a Pi-hole installation.
+
+## Included
+
+`pihole-db-monitor.sh`
+
+- Checks the size of `/etc/pihole/pihole-FTL.db`
+- Logs the current DB size to a local history file
+- Attempts a nightly `VACUUM`
+- Stops and restarts `pihole-FTL` safely for the vacuum window
+- Schedules a failsafe restart so FTL comes back within the configured downtime budget
+- Emails a maintenance report on success, timeout, or failure
+
+## What The Email Reports
+
+- Main DB size before and after vacuum
+- Approximate total SQLite footprint (`db + wal + shm`)
+- Whether `VACUUM` succeeded, failed, or timed out
+- Whether `pihole-FTL` came back within the configured deadline
+- Retained `query_storage` row count and timestamp window
+- `domain_by_id` totals versus currently referenced rows
+- `client_by_id` totals versus currently referenced rows
+- A short per-day retained query summary
+- Approximate object sizes for the biggest DB structures
+- A top-of-email overdue update warning when a newer Pi-hole release has been available for more than 7 days
+
+## Current Hypothesis
+
+The script includes stats meant to test whether long-term DB growth is mostly caused by:
+
+1. A larger current rolling query window
+2. Accumulating unreferenced linking-table rows such as `domain_by_id`
+3. Normal SQLite file-allocation behavior
+
+In practice, the most important lines to watch over time are:
+
+- `Query rows retained by TTL window`
+- `domain_by_id rows: total=..., referenced_now=..., unreferenced_now=...`
+- `client_by_id rows: total=..., referenced_now=..., unreferenced_now=...`
+
+## Runtime Defaults
+
+The script supports environment overrides for:
+
+- `DB_FILE`
+- `LOG_FILE`
+- `EMAIL`
+- `FTL_SERVICE`
+- `LOCK_FILE`
+- `MAX_DOWNTIME_MINUTES`
+- `START_GRACE_SECONDS`
+- `NO_EMAIL`
+- `DRY_RUN`
+- `MAIL_BIN`
+
+The live Pi currently uses:
+
+- `DB_FILE=/etc/pihole/pihole-FTL.db`
+- `LOG_FILE=/home/pi/pihole-db-size.log`
+- `FTL_SERVICE=pihole-FTL`
+- `MAX_DOWNTIME_MINUTES=5`
+
+## Expected Scheduling
+
+Example crontab entry:
+
+```cron
+0 4 * * * /usr/local/bin/pihole-db-monitor.sh
+```
+
+## Operational Notes
+
+- `DRY_RUN=1` skips the live stop/vacuum/start path but still gathers stats and renders the email body.
+- The script expects passwordless `sudo` for the required `sqlite3`, `systemctl`, and `systemd-run` operations.
+- `VACUUM` is done with FTL stopped because SQLite needs exclusive access to compact the file reliably.
+- The failsafe restart timer is scheduled before FTL is stopped, so there is a second path to bring DNS back if the main script stalls.
+
+## Repository Notes
+
+This repository is intended to be the source of truth for the Pi-hole maintenance script rather than leaving the only working copy on the Raspberry Pi itself.
