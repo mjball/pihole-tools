@@ -7,6 +7,10 @@ LOG_FILE="${LOG_FILE:-/home/pi/pihole-db-size.log}"
 EMAIL="${EMAIL:-mattjball@gmail.com}"
 FTL_SERVICE="${FTL_SERVICE:-pihole-FTL}"
 LOCK_FILE="${LOCK_FILE:-/tmp/pihole-db-monitor.lock}"
+# Calendar days of the month on which we do the full stop/vacuum/start path.
+# All other nights are stats-and-email only to avoid interfering with Pi-hole's
+# own query-retention cleanup.
+FULL_VACUUM_DAYS=(${FULL_VACUUM_DAYS:-1 15})
 MAX_DOWNTIME_MINUTES="${MAX_DOWNTIME_MINUTES:-5}"
 START_GRACE_SECONDS="${START_GRACE_SECONDS:-45}"
 NO_EMAIL="${NO_EMAIL:-0}"
@@ -57,6 +61,7 @@ stats_per_day="unavailable"
 stats_size_breakdown="unavailable"
 update_banner=""
 update_summary="No overdue Pi-hole updates detected."
+vacuum_day_summary=""
 
 cleanup() {
   local exit_rc=$?
@@ -109,6 +114,23 @@ sum_db_footprint() {
 
 sqlite_ro() {
   sudo sqlite3 "file:${DB_FILE}?mode=ro" "$@"
+}
+
+join_vacuum_days() {
+  local IFS=", "
+  echo "${FULL_VACUUM_DAYS[*]}"
+}
+
+should_run_vacuum_today() {
+  local today day
+  today=$(date '+%-d')
+  for day in "${FULL_VACUUM_DAYS[@]}"; do
+    if [ "$day" = "$today" ]; then
+      return 0
+    fi
+  done
+
+  return 1
 }
 
 format_epoch() {
@@ -338,6 +360,8 @@ send_email() {
     subject="Pi-hole DB Vacuum FAILED: FTL restart missed deadline"
   elif [ "$vacuum_status" = "success" ]; then
     subject="Pi-hole DB Vacuum Succeeded"
+  elif [ "$vacuum_status" = "skipped" ]; then
+    subject="Pi-hole DB Maintenance Report"
   else
     subject="Pi-hole DB Vacuum Completed With Warnings"
   fi
@@ -368,6 +392,7 @@ Approx. space reclaimed from main DB file: $reclaimed_human
 
 VACUUM status:  $vacuum_status
 VACUUM details: $vacuum_detail
+Configured full vacuum days: $vacuum_day_summary
 
 FTL restart status:  $restart_status
 FTL restart details: $restart_detail
@@ -418,6 +443,7 @@ fi
 before_human=$(to_human "$before_bytes")
 before_total_bytes=$(sum_db_footprint)
 before_total_human=$(to_human "$before_total_bytes")
+vacuum_day_summary="$(join_vacuum_days)"
 
 collect_db_stats || echo "DB stats collection failed" >>"$VACUUM_OUTPUT_FILE"
 check_overdue_updates || echo "Update check failed" >>"$VACUUM_OUTPUT_FILE"
@@ -437,10 +463,25 @@ fi
 deadline_epoch=$(( $(date +%s) + total_budget_seconds ))
 
 if [ "$DRY_RUN" = "1" ]; then
-  vacuum_status="success"
-  vacuum_detail="Dry run: Pi-hole FTL stop/start and VACUUM were skipped."
-  restart_status="success"
-  restart_detail="Dry run: Pi-hole FTL restart was not required."
+  if should_run_vacuum_today; then
+    vacuum_status="success"
+    vacuum_detail="Dry run: today is a configured vacuum day, but Pi-hole FTL stop/start and VACUUM were skipped."
+    restart_status="success"
+    restart_detail="Dry run: Pi-hole FTL restart was not required."
+  else
+    vacuum_status="skipped"
+    vacuum_detail="Dry run: today is not one of the configured full vacuum days (${vacuum_day_summary}), so no stop/vacuum/start would be attempted."
+    restart_status="not-needed"
+    restart_detail="Dry run: Pi-hole FTL restart was not required."
+  fi
+  exit 0
+fi
+
+if ! should_run_vacuum_today; then
+  vacuum_status="skipped"
+  vacuum_detail="Today is not one of the configured full vacuum days (${vacuum_day_summary}), so Pi-hole FTL was left running and VACUUM was not attempted."
+  restart_status="not-needed"
+  restart_detail="Pi-hole FTL was intentionally left running on this nightly report-only run."
   exit 0
 fi
 
