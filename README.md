@@ -14,6 +14,16 @@ Small utilities for running and maintaining a Pi-hole installation.
 - Schedules a failsafe restart so FTL comes back within the configured downtime budget on vacuum days
 - Emails a maintenance report on success, timeout, or failure
 
+`pihole-db-compact-once.sh`
+
+- Standalone one-time compaction helper for manual use
+- Captures before/after DB snapshots
+- Creates a timestamped backup before touching the DB
+- Schedules a failsafe restart before stopping `pihole-FTL`
+- Runs a checkpoint + `VACUUM` with explicit step-by-step logging
+- Restarts `pihole-FTL` and verifies that it comes back up
+- Writes a verbose timestamped log file for postmortem debugging
+
 ## What The Email Reports
 
 - Main DB size before and after vacuum
@@ -66,6 +76,16 @@ The live Pi currently uses:
 - `FULL_VACUUM_DAYS=(1 15)`
 - `MAX_DOWNTIME_MINUTES=5`
 
+The standalone one-time compaction helper supports:
+
+- `DB_FILE`
+- `FTL_SERVICE`
+- `LOG_DIR`
+- `BACKUP_DIR`
+- `MAX_DOWNTIME_MINUTES`
+- `START_WAIT_SECONDS`
+- `VACUUM_TIMEOUT_SECONDS`
+
 ## Expected Scheduling
 
 Example crontab entry:
@@ -87,6 +107,35 @@ With the current defaults:
 - `VACUUM` is done with FTL stopped because SQLite needs exclusive access to compact the file reliably.
 - The failsafe restart timer is scheduled before FTL is stopped, so there is a second path to bring DNS back if the main script stalls.
 - The nightly restart was removed because restarting FTL every day appears to prevent Pi-hole's own `maxDBdays` retention cleanup from firing reliably.
+
+## Manual Compaction Helper
+
+Install or run:
+
+```bash
+/usr/local/bin/pihole-db-compact-once.sh
+```
+
+Useful flags:
+
+```bash
+/usr/local/bin/pihole-db-compact-once.sh --dry-run
+/usr/local/bin/pihole-db-compact-once.sh --help
+```
+
+Default output locations:
+
+- Logs: `/home/pi/pihole-db-maintenance-logs`
+- Backups: `/home/pi/pihole-db-backups`
+
+The helper is intentionally noisy. It logs:
+
+- every step name
+- the exact command being run
+- command return codes
+- before/after SQLite page and freelist counts
+- before/after retained query windows
+- whether `pihole-FTL` was stopped, restarted, or recovered by the cleanup trap
 
 ## Repository Notes
 
