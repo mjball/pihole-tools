@@ -8,11 +8,11 @@ Small utilities for running and maintaining a Pi-hole installation.
 
 - Checks the size of `/etc/pihole/pihole-FTL.db`
 - Logs the current DB size to a local history file
-- Sends a nightly maintenance report without restarting Pi-hole on most days
+- Sends a weekly summary plus alert-on-change emails instead of a nightly report
 - Attempts a scheduled `VACUUM` only on specific calendar days
 - Stops and restarts `pihole-FTL` safely for the vacuum window on those scheduled days
 - Schedules a failsafe restart so FTL comes back within the configured downtime budget on vacuum days
-- Emails a maintenance report on success, timeout, or failure
+- Emails immediately for new warning conditions or operational failures
 
 `pihole-db-compact-once.sh`
 
@@ -24,6 +24,15 @@ Small utilities for running and maintaining a Pi-hole installation.
 - Restarts `pihole-FTL` and verifies that it comes back up
 - Writes a verbose timestamped log file for postmortem debugging
 
+## When Email Is Sent
+
+- Every Sunday by default for a weekly summary
+- Immediately when a new warning condition appears
+- Immediately when an operational failure happens, such as a failed vacuum or failed FTL restart
+- Not sent on normal healthy weekdays once the current warning state is unchanged
+
+The script keeps a small state file so persistent warnings such as overdue updates do not re-email every night.
+
 ## What The Email Reports
 
 - Main DB size before and after vacuum
@@ -31,6 +40,9 @@ Small utilities for running and maintaining a Pi-hole installation.
 - Whether `VACUUM` succeeded, failed, or timed out
 - Whether `VACUUM` was intentionally skipped on a report-only night
 - Whether `pihole-FTL` came back within the configured deadline
+- Why the email was sent
+- Current alert conditions, if any
+- FTL state, free disk, available memory, WAL size, and SQLite freelist usage
 - Retained `query_storage` row count and timestamp window
 - `domain_by_id` totals versus currently referenced rows
 - `client_by_id` totals versus currently referenced rows
@@ -61,9 +73,17 @@ The script supports environment overrides for:
 - `EMAIL`
 - `FTL_SERVICE`
 - `LOCK_FILE`
+- `STATE_FILE`
 - `FULL_VACUUM_DAYS`
 - `MAX_DOWNTIME_MINUTES`
 - `START_GRACE_SECONDS`
+- `SUMMARY_WEEKDAY`
+- `MAX_QUERY_AGE_DAYS`
+- `MIN_DISK_FREE_PCT`
+- `MIN_MEM_AVAILABLE_MIB`
+- `WAL_ALERT_MIB`
+- `WAL_ALERT_STREAK`
+- `POST_VACUUM_MAX_FREELIST_PCT`
 - `NO_EMAIL`
 - `DRY_RUN`
 - `MAIL_BIN`
@@ -73,8 +93,16 @@ The live Pi currently uses:
 - `DB_FILE=/etc/pihole/pihole-FTL.db`
 - `LOG_FILE=/home/pi/pihole-db-size.log`
 - `FTL_SERVICE=pihole-FTL`
+- `STATE_FILE=/home/pi/.cache/pihole-db-monitor.state`
 - `FULL_VACUUM_DAYS=(1 15)`
 - `MAX_DOWNTIME_MINUTES=5`
+- `SUMMARY_WEEKDAY=7` (Sunday)
+- `MAX_QUERY_AGE_DAYS=4`
+- `MIN_DISK_FREE_PCT=15`
+- `MIN_MEM_AVAILABLE_MIB=150`
+- `WAL_ALERT_MIB=64`
+- `WAL_ALERT_STREAK=2`
+- `POST_VACUUM_MAX_FREELIST_PCT=50`
 
 The standalone one-time compaction helper supports:
 
@@ -96,13 +124,16 @@ Example crontab entry:
 
 With the current defaults:
 
-- Every night at `2:00 AM`: gather stats and send the email report
+- Every night at `2:00 AM`: gather stats and evaluate alert conditions
+- Every Sunday: send the weekly summary email
 - On the `1st` and `15th` of each month: also do the full stop/vacuum/start maintenance path
+- On healthy weekdays with no new warning state: do not send email
 
 ## Operational Notes
 
-- `DRY_RUN=1` skips the live stop/vacuum/start path but still gathers stats and renders the email body.
+- `DRY_RUN=1` skips the live stop/vacuum/start path but still gathers stats and evaluates whether that run would have sent email.
 - `FULL_VACUUM_DAYS` is a shell-style list of numeric day-of-month values, for example `1 15`.
+- `SUMMARY_WEEKDAY` uses `date +%u` numbering, where `7` is Sunday.
 - The script expects passwordless `sudo` for the required `sqlite3`, `systemctl`, and `systemd-run` operations.
 - `VACUUM` is done with FTL stopped because SQLite needs exclusive access to compact the file reliably.
 - The failsafe restart timer is scheduled before FTL is stopped, so there is a second path to bring DNS back if the main script stalls.

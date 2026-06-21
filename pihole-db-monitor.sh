@@ -7,12 +7,20 @@ LOG_FILE="${LOG_FILE:-/home/pi/pihole-db-size.log}"
 EMAIL="${EMAIL:-mattjball@gmail.com}"
 FTL_SERVICE="${FTL_SERVICE:-pihole-FTL}"
 LOCK_FILE="${LOCK_FILE:-/tmp/pihole-db-monitor.lock}"
+STATE_FILE="${STATE_FILE:-/home/pi/.cache/pihole-db-monitor.state}"
 # Calendar days of the month on which we do the full stop/vacuum/start path.
 # All other nights are stats-and-email only to avoid interfering with Pi-hole's
 # own query-retention cleanup.
 FULL_VACUUM_DAYS=(${FULL_VACUUM_DAYS:-1 15})
 MAX_DOWNTIME_MINUTES="${MAX_DOWNTIME_MINUTES:-5}"
 START_GRACE_SECONDS="${START_GRACE_SECONDS:-45}"
+SUMMARY_WEEKDAY="${SUMMARY_WEEKDAY:-7}"
+MAX_QUERY_AGE_DAYS="${MAX_QUERY_AGE_DAYS:-4}"
+MIN_DISK_FREE_PCT="${MIN_DISK_FREE_PCT:-15}"
+MIN_MEM_AVAILABLE_MIB="${MIN_MEM_AVAILABLE_MIB:-150}"
+WAL_ALERT_MIB="${WAL_ALERT_MIB:-64}"
+WAL_ALERT_STREAK="${WAL_ALERT_STREAK:-2}"
+POST_VACUUM_MAX_FREELIST_PCT="${POST_VACUUM_MAX_FREELIST_PCT:-50}"
 NO_EMAIL="${NO_EMAIL:-0}"
 DRY_RUN="${DRY_RUN:-0}"
 MAIL_BIN="${MAIL_BIN:-mail}"
@@ -24,6 +32,22 @@ if ! flock -n 9; then
 fi
 
 touch "$LOG_FILE"
+load_state() {
+  if [ -f "$STATE_FILE" ]; then
+    # shellcheck disable=SC1090
+    . "$STATE_FILE"
+  fi
+}
+
+save_state() {
+  mkdir -p "$(dirname "$STATE_FILE")"
+  cat >"$STATE_FILE" <<EOF
+last_warning_hash='${last_warning_hash//\'/\'\\\'\'}'
+wal_large_streak='${wal_large_streak}'
+EOF
+}
+
+load_state
 VACUUM_OUTPUT_FILE=$(mktemp /tmp/pihole-db-monitor.XXXXXX)
 
 before_bytes=0
@@ -50,6 +74,8 @@ mail_status="not-sent"
 mail_detail="Email not attempted."
 
 stats_query_rows="unknown"
+stats_query_min_epoch="unknown"
+stats_query_max_epoch="unknown"
 stats_query_window="unknown"
 stats_domain_total="unknown"
 stats_domain_referenced="unknown"
@@ -59,9 +85,31 @@ stats_client_referenced="unknown"
 stats_client_unreferenced="unknown"
 stats_per_day="unavailable"
 stats_size_breakdown="unavailable"
+stats_page_size="unknown"
+stats_page_count="unknown"
+stats_freelist_count="unknown"
+stats_freelist_pct="unknown"
+stats_journal_mode="unknown"
+stats_ftl_state="unknown"
+stats_disk_free_pct="unknown"
+stats_disk_available_mib="unknown"
+stats_mem_available_mib="unknown"
+stats_wal_bytes=0
+stats_wal_human="0B"
 update_banner=""
 update_summary="No overdue Pi-hole updates detected."
+update_state="ok"
 vacuum_day_summary=""
+is_summary_day=0
+should_email=1
+warning_fingerprint=""
+mail_subject="Pi-hole DB Maintenance Report"
+report_reason_lines="  - Nightly maintenance report."
+critical_alerts="  - none"
+warning_alerts="  - none"
+current_alerts="  - none"
+last_warning_hash="${last_warning_hash:-}"
+wal_large_streak="${wal_large_streak:-0}"
 
 cleanup() {
   local exit_rc=$?
@@ -84,12 +132,18 @@ cleanup() {
     reclaimed_human=$(to_human "$reclaimed_bytes")
   fi
 
+  date_now=$(date '+%Y-%m-%d %H:%M:%S')
+  collect_db_stats >>"$VACUUM_OUTPUT_FILE" 2>&1 || true
+  collect_runtime_health >>"$VACUUM_OUTPUT_FILE" 2>&1 || true
+  decide_email_policy
+
   echo "$date_now $after_human" >> "$LOG_FILE"
 
   if ! send_email; then
     exit_rc=1
   fi
 
+  save_state || exit_rc=1
   cancel_failsafe
   rm -f "$VACUUM_OUTPUT_FILE"
   exit "$exit_rc"
@@ -119,6 +173,28 @@ sqlite_ro() {
 join_vacuum_days() {
   local IFS=", "
   echo "${FULL_VACUUM_DAYS[*]}"
+}
+
+format_duration() {
+  local total_seconds=$1
+  local days hours minutes
+
+  if [ "$total_seconds" -lt 60 ]; then
+    echo "${total_seconds}s"
+    return 0
+  fi
+
+  days=$((total_seconds / 86400))
+  hours=$(((total_seconds % 86400) / 3600))
+  minutes=$(((total_seconds % 3600) / 60))
+
+  if [ "$days" -gt 0 ]; then
+    echo "${days}d ${hours}h"
+  elif [ "$hours" -gt 0 ]; then
+    echo "${hours}h ${minutes}m"
+  else
+    echo "${minutes}m"
+  fi
 }
 
 should_run_vacuum_today() {
@@ -174,7 +250,9 @@ SQL
     stats_client_referenced \
     stats_client_unreferenced <<< "$summary_raw"
 
-  stats_query_window="$(format_epoch "$min_ts") -> $(format_epoch "$max_ts")"
+  stats_query_min_epoch="${min_ts:-unknown}"
+  stats_query_max_epoch="${max_ts:-unknown}"
+  stats_query_window="$(format_epoch "$stats_query_min_epoch") -> $(format_epoch "$stats_query_max_epoch")"
 
   stats_per_day=$(sqlite_ro -noheader <<'SQL'
 SELECT '  - ' || date(timestamp,'unixepoch','localtime') || ': rows=' || COUNT(*) || ', unique_domains=' || COUNT(DISTINCT domain) || ', unique_clients=' || COUNT(DISTINCT client)
@@ -199,6 +277,17 @@ SQL
   if [ -z "$stats_size_breakdown" ]; then
     stats_size_breakdown="  - unavailable"
   fi
+
+  stats_page_size=$(sqlite_ro 'PRAGMA page_size;' 2>/dev/null | tr -d '[:space:]')
+  stats_page_count=$(sqlite_ro 'PRAGMA page_count;' 2>/dev/null | tr -d '[:space:]')
+  stats_freelist_count=$(sqlite_ro 'PRAGMA freelist_count;' 2>/dev/null | tr -d '[:space:]')
+  stats_journal_mode=$(sqlite_ro 'PRAGMA journal_mode;' 2>/dev/null | tr -d '[:space:]')
+
+  if [[ "$stats_page_count" =~ ^[0-9]+$ ]] && [ "$stats_page_count" -gt 0 ] && [[ "$stats_freelist_count" =~ ^[0-9]+$ ]]; then
+    stats_freelist_pct=$((stats_freelist_count * 100 / stats_page_count))
+  else
+    stats_freelist_pct="unknown"
+  fi
 }
 
 check_overdue_updates() {
@@ -206,6 +295,7 @@ check_overdue_updates() {
 
   version_json=$(curl --max-time 10 -fsSL 'http://127.0.0.1/api/info/version' 2>/dev/null || true)
   if [ -z "$version_json" ]; then
+    update_state="unavailable"
     update_summary="Update check unavailable: local version API did not respond."
     return 1
   fi
@@ -253,6 +343,9 @@ for label, repo, key in components:
         errors.append(f"- {label}: update check failed ({exc})")
 
 if lines:
+    print("STATE_START")
+    print("overdue")
+    print("STATE_END")
     print("BANNER_START")
     print("*** UPDATE OVERDUE ***")
     print("Pi-hole updates have been available for more than 1 week:")
@@ -264,12 +357,18 @@ if lines:
         print(line)
     print("SUMMARY_END")
 elif errors:
+    print("STATE_START")
+    print("incomplete")
+    print("STATE_END")
     print("SUMMARY_START")
     print("Update check incomplete:")
     for line in errors:
         print(line)
     print("SUMMARY_END")
 else:
+    print("STATE_START")
+    print("ok")
+    print("STATE_END")
     print("SUMMARY_START")
     print("No overdue Pi-hole updates detected.")
     print("SUMMARY_END")
@@ -280,9 +379,183 @@ PY
 ' "$python_output" | sed -n '/^BANNER_START$/,/^BANNER_END$/p' | sed '1d;$d')
   update_summary=$(printf '%s
 ' "$python_output" | sed -n '/^SUMMARY_START$/,/^SUMMARY_END$/p' | sed '1d;$d')
+  update_state=$(printf '%s
+' "$python_output" | sed -n '/^STATE_START$/,/^STATE_END$/p' | sed '1d;$d' | head -n 1)
 
   if [ -z "$update_summary" ]; then
     update_summary="Update check completed with no additional details."
+  fi
+
+  if [ -z "$update_state" ]; then
+    if [ -n "$update_banner" ]; then
+      update_state="overdue"
+    else
+      update_state="ok"
+    fi
+  fi
+}
+
+collect_runtime_health() {
+  local disk_raw mem_kib
+
+  stats_ftl_state=$(systemctl is-active "$FTL_SERVICE" 2>/dev/null || echo "unknown")
+
+  disk_raw=$(df -Pm "$DB_FILE" 2>/dev/null | awk 'NR==2 {gsub("%","",$5); printf "%s|%s", 100-$5, $4}')
+  if [ -n "$disk_raw" ]; then
+    IFS='|' read -r stats_disk_free_pct stats_disk_available_mib <<< "$disk_raw"
+  fi
+
+  mem_kib=$(awk '/MemAvailable:/ {print $2}' /proc/meminfo 2>/dev/null || true)
+  if [[ "$mem_kib" =~ ^[0-9]+$ ]]; then
+    stats_mem_available_mib=$((mem_kib / 1024))
+  fi
+
+  stats_wal_bytes=$(stat -c%s "${DB_FILE}-wal" 2>/dev/null || echo 0)
+  if ! [[ "$stats_wal_bytes" =~ ^[0-9]+$ ]]; then
+    stats_wal_bytes=0
+  fi
+  stats_wal_human=$(to_human "$stats_wal_bytes")
+}
+
+decide_email_policy() {
+  local today_weekday now_epoch max_query_age_seconds oldest_age_seconds oldest_age_human
+  local wal_threshold_bytes critical_lines warning_lines warning_keys
+
+  today_weekday=$(date '+%u')
+  now_epoch=$(date +%s)
+  max_query_age_seconds=$((MAX_QUERY_AGE_DAYS * 86400))
+  wal_threshold_bytes=$((WAL_ALERT_MIB * 1024 * 1024))
+  critical_lines=""
+  warning_lines=""
+  warning_keys=""
+
+  should_email=0
+  is_summary_day=0
+  report_reason_lines="  - No alert conditions and not the weekly summary day."
+  critical_alerts="  - none"
+  warning_alerts="  - none"
+  current_alerts="  - none"
+  warning_fingerprint=""
+
+  if [ "$today_weekday" = "$SUMMARY_WEEKDAY" ]; then
+    is_summary_day=1
+    should_email=1
+    report_reason_lines="  - Weekly summary day."
+  fi
+
+  if [ "$restart_status" = "failed" ]; then
+    critical_lines="${critical_lines}  - Pi-hole FTL did not report active within the ${MAX_DOWNTIME_MINUTES}-minute downtime budget.\n"
+  fi
+  if [ "$vacuum_status" = "failed" ] || [ "$vacuum_status" = "timed_out" ]; then
+    critical_lines="${critical_lines}  - Scheduled VACUUM did not complete successfully: ${vacuum_detail}\n"
+  fi
+  if [ "$stats_ftl_state" != "active" ]; then
+    critical_lines="${critical_lines}  - Pi-hole FTL service state is '${stats_ftl_state}'.\n"
+  fi
+  if [ "$stats_query_rows" = "unknown" ]; then
+    critical_lines="${critical_lines}  - Query statistics could not be collected from ${DB_FILE}.\n"
+  fi
+
+  if [[ "$stats_query_min_epoch" =~ ^[0-9]+$ ]]; then
+    oldest_age_seconds=$((now_epoch - stats_query_min_epoch))
+    if [ "$oldest_age_seconds" -gt "$max_query_age_seconds" ]; then
+      oldest_age_human=$(format_duration "$oldest_age_seconds")
+      warning_keys="${warning_keys}retention-window\n"
+      warning_lines="${warning_lines}  - Oldest retained query is ${oldest_age_human} old, beyond the ${MAX_QUERY_AGE_DAYS}-day alert threshold.\n"
+    fi
+  fi
+
+  if [[ "$stats_disk_free_pct" =~ ^[0-9]+$ ]] && [ "$stats_disk_free_pct" -lt "$MIN_DISK_FREE_PCT" ]; then
+    warning_keys="${warning_keys}disk-free\n"
+    warning_lines="${warning_lines}  - Disk free space is ${stats_disk_free_pct}% (${stats_disk_available_mib} MiB available), below the ${MIN_DISK_FREE_PCT}% threshold.\n"
+  fi
+
+  if [[ "$stats_mem_available_mib" =~ ^[0-9]+$ ]] && [ "$stats_mem_available_mib" -lt "$MIN_MEM_AVAILABLE_MIB" ]; then
+    warning_keys="${warning_keys}mem-available\n"
+    warning_lines="${warning_lines}  - MemAvailable is ${stats_mem_available_mib} MiB, below the ${MIN_MEM_AVAILABLE_MIB} MiB threshold.\n"
+  fi
+
+  if [ "$stats_wal_bytes" -ge "$wal_threshold_bytes" ]; then
+    wal_large_streak=$((wal_large_streak + 1))
+  else
+    wal_large_streak=0
+  fi
+  if [ "$wal_large_streak" -ge "$WAL_ALERT_STREAK" ]; then
+    warning_keys="${warning_keys}wal-large\n"
+    warning_lines="${warning_lines}  - WAL file is ${stats_wal_human} for ${wal_large_streak} consecutive night(s), above the ${WAL_ALERT_MIB} MiB threshold.\n"
+  fi
+
+  if [ "$update_state" = "overdue" ]; then
+    warning_keys="${warning_keys}updates-overdue\n"
+    warning_lines="${warning_lines}  - Pi-hole updates have been available for more than 1 week.\n"
+  elif [ "$update_state" = "unavailable" ] || [ "$update_state" = "incomplete" ]; then
+    warning_keys="${warning_keys}update-check\n"
+    warning_lines="${warning_lines}  - ${update_summary}\n"
+  fi
+
+  if [ "$service_was_stopped" = "1" ] && [ "$vacuum_status" = "success" ] && [[ "$stats_freelist_pct" =~ ^[0-9]+$ ]] && [ "$stats_freelist_pct" -gt "$POST_VACUUM_MAX_FREELIST_PCT" ]; then
+    warning_keys="${warning_keys}post-vacuum-freelist\n"
+    warning_lines="${warning_lines}  - SQLite freelist is still ${stats_freelist_pct}% of pages after the scheduled vacuum (${stats_freelist_count}/${stats_page_count}), so the main DB file may not have compacted.\n"
+  fi
+
+  if [ -n "$critical_lines" ]; then
+    critical_alerts=$(printf '%b' "$critical_lines")
+    current_alerts=$(printf '%b' "$critical_lines")
+    should_email=1
+    report_reason_lines="  - Immediate alert: operational issue detected."
+  fi
+
+  if [ -n "$warning_lines" ]; then
+    warning_alerts=$(printf '%b' "$warning_lines")
+    if [ -n "$critical_lines" ]; then
+      current_alerts=$(printf '%b' "${critical_lines}${warning_lines}")
+    else
+      current_alerts=$warning_alerts
+    fi
+    warning_fingerprint=$(printf '%b' "$warning_keys" | awk 'NF' | sort -u | sha256sum | awk '{print $1}')
+    if [ "$warning_fingerprint" != "$last_warning_hash" ]; then
+      should_email=1
+      if [ "$report_reason_lines" = "  - Weekly summary day." ]; then
+        report_reason_lines="${report_reason_lines}
+  - New warning condition(s) detected."
+      elif [ "$report_reason_lines" = "  - Immediate alert: operational issue detected." ]; then
+        report_reason_lines="${report_reason_lines}
+  - New warning condition(s) also detected."
+      else
+        report_reason_lines="  - New warning condition(s) detected."
+      fi
+    fi
+  fi
+
+  if [ -z "$warning_fingerprint" ]; then
+    last_warning_hash=""
+  else
+    last_warning_hash="$warning_fingerprint"
+  fi
+
+  if [ "$NO_EMAIL" = "1" ]; then
+    should_email=0
+    mail_status="suppressed"
+    mail_detail="NO_EMAIL=1"
+    return 0
+  fi
+
+  if [ "$should_email" != "1" ]; then
+    mail_status="suppressed"
+    mail_detail="No alert conditions and not the weekly summary day."
+    return 0
+  fi
+
+  if [ -n "$critical_lines" ]; then
+    mail_subject="Pi-hole DB ALERT"
+  elif [ "$is_summary_day" = "1" ]; then
+    if [ -n "$warning_lines" ]; then
+      mail_subject="Pi-hole DB Weekly Summary (Warnings Active)"
+    else
+      mail_subject="Pi-hole DB Weekly Summary"
+    fi
+  else
+    mail_subject="Pi-hole DB Warning"
   fi
 }
 
@@ -343,7 +616,7 @@ ensure_ftl_running() {
 }
 
 send_email() {
-  local history subject downtime_summary output_tail update_block
+  local history downtime_summary output_tail update_block
 
   history=$(tail -n 7 "$LOG_FILE" | tac 2>/dev/null || true)
   output_tail=$(tail -n 20 "$VACUUM_OUTPUT_FILE" 2>/dev/null || true)
@@ -356,19 +629,7 @@ send_email() {
     downtime_summary="0 second(s)"
   fi
 
-  if [ "$restart_status" = "failed" ]; then
-    subject="Pi-hole DB Vacuum FAILED: FTL restart missed deadline"
-  elif [ "$vacuum_status" = "success" ]; then
-    subject="Pi-hole DB Vacuum Succeeded"
-  elif [ "$vacuum_status" = "skipped" ]; then
-    subject="Pi-hole DB Maintenance Report"
-  else
-    subject="Pi-hole DB Vacuum Completed With Warnings"
-  fi
-
-  if [ "$NO_EMAIL" = "1" ]; then
-    mail_status="suppressed"
-    mail_detail="NO_EMAIL=1"
+  if [ "$should_email" != "1" ]; then
     return 0
   fi
 
@@ -379,10 +640,16 @@ send_email() {
 "
   fi
 
-  if "$MAIL_BIN" -s "$subject" "$EMAIL" <<MAIL_EOF
+  if "$MAIL_BIN" -s "$mail_subject" "$EMAIL" <<MAIL_EOF
 Hello,
 
 ${update_block}The Pi-hole DB maintenance run completed at $date_now.
+
+Report reason:
+$report_reason_lines
+
+Current alerts:
+$current_alerts
 
 Main DB size before VACUUM: $before_human
 Main DB size after VACUUM:  $after_human
@@ -398,6 +665,13 @@ FTL restart status:  $restart_status
 FTL restart details: $restart_detail
 Maximum allowed downtime: ${MAX_DOWNTIME_MINUTES} minute(s)
 Observed downtime:        $downtime_summary
+
+Health checks:
+- FTL service state: $stats_ftl_state
+- Disk free: ${stats_disk_free_pct}% (${stats_disk_available_mib} MiB available)
+- MemAvailable: ${stats_mem_available_mib} MiB
+- WAL size: $stats_wal_human
+- SQLite freelist: ${stats_freelist_count}/${stats_page_count} pages (${stats_freelist_pct}% free)
 
 Hypothesis check:
 - Query rows retained by TTL window: $stats_query_rows
@@ -446,6 +720,7 @@ before_total_human=$(to_human "$before_total_bytes")
 vacuum_day_summary="$(join_vacuum_days)"
 
 collect_db_stats || echo "DB stats collection failed" >>"$VACUUM_OUTPUT_FILE"
+collect_runtime_health || echo "Runtime health collection failed" >>"$VACUUM_OUTPUT_FILE"
 check_overdue_updates || echo "Update check failed" >>"$VACUUM_OUTPUT_FILE"
 
 total_budget_seconds=$((MAX_DOWNTIME_MINUTES * 60))
