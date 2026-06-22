@@ -1,0 +1,20 @@
+name: Test
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  shell-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Syntax check scripts
+        run: |
+          bash -n pihole-db-monitor.sh
+          bash -n pihole-db-compact-once.sh
+          bash -n tests/test_pihole_db_monitor.sh
+
+      - name: Run monitor tests
+        run: bash tests/test_pihole_db_monitor.sh

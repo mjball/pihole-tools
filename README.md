@@ -168,6 +168,30 @@ The helper is intentionally noisy. It logs:
 - before/after retained query windows
 - whether `pihole-FTL` was stopped, restarted, or recovered by the cleanup trap
 
+## Testing
+
+Run the automated monitor-script tests locally with:
+
+```bash
+bash tests/test_pihole_db_monitor.sh
+```
+
+What is covered today:
+
+- weekly summary vs weekday suppression
+- new warning detection vs persistent-warning suppression
+- overdue-update alert behavior
+- vacuum timeout alert behavior
+- quiet successful vacuum days
+- WAL streak alert behavior across multiple runs
+
+GitHub Actions also runs:
+
+- `bash -n` syntax checks for both scripts and the test harness
+- the monitor-script test harness on `ubuntu-latest`
+
+The one-time compaction helper currently has syntax coverage in CI, but not the same fixture-driven behavioral tests yet.
+
 ## Repository Notes
 
 This repository is intended to be the source of truth for the Pi-hole maintenance script rather than leaving the only working copy on the Raspberry Pi itself.
